@@ -10,11 +10,13 @@
 
 #include <avr/wdt.h>
 
-#define COMMAND_DISARM (0x68)
-#define COMMAND_ARM    (0x69)
+#include "crc8.hpp"
+
+#define COMMAND_DISARM (0xFF)
+#define COMMAND_ARM    (0xAA)
 
 #define SOFTWARE_TIMEOUT (1000)
-#define REMOTE_TIMEOUT   (100)
+#define REMOTE_TIMEOUT   (250)
 
 #define DISARM_TIME      (5000)
 
@@ -29,13 +31,15 @@ enum class State : uint8_t {
 };
 
 struct StatePacket {
+  uint16_t servoInputSteeringValue;
+  uint16_t servoInputThrottleValue;
+
+  // NOTE: not atomically assignable
   bool servoInputSteeringUpdate : 1;
   bool servoInputThrottleUpdate : 1;
   bool armable                  : 1;
   uint8_t unused1               : 2;
   State state                   : 3;
-  uint16_t servoInputSteeringValue;
-  uint16_t servoInputThrottleValue;
 
   // handy shortcuts to the state
   State operator=(const State state_) {
@@ -54,25 +58,34 @@ ServoInputPin<servoInputSteeringPin> servoInputSteering;
 ServoInputPin<servoInputThrottlePin> servoInputThrottle;
 
 static volatile StatePacket state = {
+  .servoInputSteeringValue = 1500,
+  .servoInputThrottleValue = 1500,
   .servoInputSteeringUpdate = false,
   .servoInputThrottleUpdate = false,
   .armable = false,
   .unused1 = 0,
-  .state = State::Disarmed,
-
-  .servoInputSteeringValue = 1500,
-  .servoInputThrottleValue = 1500
+  .state = State::Disarmed
 };
 
 volatile unsigned long armTime = 0;
 volatile unsigned long disarmTime = 0;
 volatile unsigned long remoteTime = 0;
 
+void enable() {
+  digitalWrite(disableSteeringPin, LOW);
+  digitalWrite(enableThrottlePin, HIGH);
+}
+
+void disable() {
+  digitalWrite(enableThrottlePin, LOW);
+  digitalWrite(disableSteeringPin, HIGH);
+}
+
 void setup() {
   pinMode(disableSteeringPin, OUTPUT);
   pinMode(enableThrottlePin, OUTPUT);
-  digitalWrite(disableSteeringPin, HIGH);
-  digitalWrite(enableThrottlePin, LOW);
+  disable();
+
   wdt_enable(WDTO_1S);
 
   Wire.begin(peripheralAddress);
@@ -87,14 +100,12 @@ bool remoteArmed() {
 
 void arm() {
   armTime = millis();
-  digitalWrite(disableSteeringPin, LOW);
-  digitalWrite(enableThrottlePin, HIGH);
+  enable();
 }
 
 void disarm() {
   disarmTime = millis();
-  digitalWrite(enableThrottlePin, LOW);
-  digitalWrite(disableSteeringPin, HIGH);
+  disable();
 }
 
 void loop() {
@@ -118,14 +129,12 @@ void loop() {
     interrupts();
   }
 
-  // update armable flag
-  state.armable = remoteArmed();
-
   // Check if we need to make a state transistion
   noInterrupts();
+  state.armable = remoteArmed();
   switch (state.state) {
     case State::Armed:
-      if (!remoteArmed()) {
+      if (!state.armable) {
         disarm();
         state = State::DisarmingRemote;
       } else if ((millis() - armTime) >= SOFTWARE_TIMEOUT) {
@@ -134,18 +143,22 @@ void loop() {
       }
       break;
 
-    case State::Disarmed:
-      break;
-    
     case State::DisarmingRequested:
     case State::DisarmingRemote:
     case State::DisarmingSoftware:
       if ((millis() - disarmTime) >= DISARM_TIME) {
-        state = State::Disarmed;        
+        state = State::Disarmed;
       }
+      /* FALLTHROUGH */
+    case State::Disarmed:
+      /* FALLTHROUGH */
+    default:
+      disable();
       break;
   }
   interrupts();
+
+  // reset watchdog
   wdt_reset();
 }
 
@@ -161,15 +174,13 @@ void receiveEvent(int length) {
       break;
     
     case COMMAND_DISARM:
-      disarm();
+      /* FALLTHROUGH */
+    default:
       if (state.state == State::Armed) {
+        disarm();
         state = State::DisarmingRequested;
       }
       break;
-
-    default:
-      break;
-      /* do nothing */
   }
 
   // dump remainder of rx buffer
@@ -180,6 +191,7 @@ void receiveEvent(int length) {
 
 void requestEvent() {
   Wire.write(reinterpret_cast<volatile uint8_t*>(&state), sizeof state);
+  Wire.write(calculateCRC8(0, reinterpret_cast<volatile uint8_t*>(&state), sizeof state));
   state.servoInputSteeringUpdate = false;
   state.servoInputThrottleUpdate = false;
 }
